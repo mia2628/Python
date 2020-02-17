@@ -1,3 +1,3 @@
-class Badminton:
+class Basketball:
   def coach(self):
-    print("hurryup!!")
+    print("hurryup!")
