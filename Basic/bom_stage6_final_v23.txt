@@ -1,0 +1,247 @@
+# -*- coding: utf-8 -*-
+# Stage6 FINAL v23 - v22 + BOM TREE (대표품번 + Parent-Child)
+
+from pyautocad import Autocad
+import pandas as pd
+import re
+import os
+import time
+from datetime import datetime
+
+acad = Autocad(create_if_not_exists=True)
+
+HAS_ALPHA = re.compile(r'[A-Za-z]')
+HAS_KR = re.compile(r'[\uAC00-\uD7A3]')
+MAKER_PATTERN = re.compile(r'.+\([A-Z]{2}\)')
+
+# ---------- COMMON ----------
+def norm(t):
+    if t is None:
+        return ""
+    return str(t).encode("utf-8","ignore").decode("utf-8").replace("\n"," ").strip()
+
+def is_part_code(token):
+    if token.isdigit() and len(token) >= 4:
+        return True
+    if re.match(r'^[0-9]+-[0-9A-Za-z\-]+$', token):
+        return True
+    if HAS_ALPHA.search(token) and len(token) >= 4:
+        return True
+    return False
+
+# ---------- COM RETRY ----------
+def com_retry(func, retries=5, delay=0.3):
+    for i in range(retries):
+        try:
+            return func()
+        except:
+            if i == retries - 1:
+                return None
+            time.sleep(delay)
+
+# ---------- OPEN ----------
+def open_dwg_safe(file_path):
+    return com_retry(lambda: acad.app.Documents.Open(file_path))
+
+# ---------- READ ----------
+def read_text_safe(doc):
+
+    rows=[]
+    drawing_name = doc.Name
+
+    ms = com_retry(lambda: doc.ModelSpace)
+    if ms is None:
+        return pd.DataFrame()
+
+    for obj in ms:
+        try:
+            name = obj.ObjectName
+            if name not in ["AcDbText","AcDbMText"]:
+                continue
+
+            txt = com_retry(lambda: obj.TextString if name=="AcDbText" else obj.Text)
+            txt = norm(txt)
+            if not txt:
+                continue
+
+            pt = com_retry(lambda: obj.InsertionPoint)
+            if pt is None:
+                continue
+
+            x,y,_ = pt
+
+            rows.append({
+                "DRAWING_FILE": drawing_name,
+                "X": float(x),
+                "Y": float(y),
+                "TEXT": txt
+            })
+
+        except:
+            continue
+
+    return pd.DataFrame(rows)
+
+# ---------- GROUP ----------
+def build_rows(df, tol=1.0):
+    df = df.sort_values(["Y","X"], ascending=[False, True]).reset_index(drop=True)
+    rows=[]; cur=[]; last=None
+
+    for _,r in df.iterrows():
+        if last is None or abs(r["Y"]-last)<=tol:
+            cur.append(r)
+        else:
+            rows.append(cur); cur=[r]
+        last=r["Y"]
+
+    if cur: rows.append(cur)
+    return rows
+
+def split_row_by_x(row, gap=60):
+    row=sorted(row,key=lambda r:r["X"])
+    groups=[]; cur=[]; last=None
+
+    for r in row:
+        if last is None or abs(r["X"]-last)<=gap:
+            cur.append(r)
+        else:
+            groups.append(cur); cur=[r]
+        last=r["X"]
+
+    if cur: groups.append(cur)
+    return groups
+
+# ---------- PARSE ----------
+def parse_group(group):
+
+    group_sorted = sorted(group, key=lambda x:x["X"])
+    tokens = [r["TEXT"] for r in group_sorted]
+    drawing_name = group_sorted[0]["DRAWING_FILE"]
+
+    part_no=""
+    for t in tokens:
+        if MAKER_PATTERN.match(t): continue
+        if is_part_code(t):
+            part_no=t; break
+
+    maker=""
+    for t in tokens:
+        if MAKER_PATTERN.match(t):
+            maker=t
+
+    name_tokens=[]
+    for t in tokens:
+        if t in [part_no, maker]: continue
+        if t.isdigit() and len(t)<=3: continue
+        name_tokens.append(t)
+
+    if name_tokens:
+        last=name_tokens[-1]
+        if is_part_code(last):
+            part_no=last
+            name_tokens=name_tokens[:-1]
+
+    name=" ".join(name_tokens).strip()
+
+    item=""
+    for i,r in enumerate(group_sorted):
+        if r["TEXT"] in name_tokens:
+            idx=i; break
+    else:
+        idx=0
+
+    for j in range(idx-1,-1,-1):
+        t=group_sorted[j]["TEXT"]
+        if t.isdigit() and len(t)<=3:
+            item=t; break
+
+    qty_candidates=[t for t in tokens if t.isdigit() and t!=item and len(t)<=3]
+    qty=qty_candidates[-1] if qty_candidates else "1"
+
+    return {
+        "DRAWING_FILE":drawing_name,
+        "ITEM_NO":item,
+        "PART_NAME":name,
+        "QTY":qty,
+        "PART_NO":part_no,
+        "MAKER":maker
+    }
+
+# ---------- 대표 품번 ----------
+def get_rep_part(drawing_file):
+    base = os.path.splitext(drawing_file)[0]
+    return base.upper()
+
+# ---------- Parent-Child ----------
+def build_relation(df):
+
+    rep_map = {d:get_rep_part(d) for d in df["DRAWING_FILE"].unique()}
+    relations=[]
+
+    for _,row in df.iterrows():
+        parent = row["DRAWING_FILE"]
+        part = row["PART_NO"]
+
+        for dwg,rep in rep_map.items():
+            if part and rep.startswith(part[:6]):
+                relations.append({
+                    "PARENT_DRAWING": parent,
+                    "CHILD_DRAWING": dwg,
+                    "PART_NO": part
+                })
+
+    return pd.DataFrame(relations)
+
+# ---------- CLOSE ----------
+def close_doc_safe(doc):
+    com_retry(lambda: doc.Close(False))
+
+# ---------- MAIN ----------
+def main():
+
+    folder_path = input("DWG 폴더 경로 입력: ").strip()
+    all_results=[]
+
+    files=[f for f in os.listdir(folder_path) if f.lower().endswith(".dwg")]
+
+    for file in files:
+        full=os.path.join(folder_path,file)
+        print(f"[INFO] {file}")
+
+        doc=open_dwg_safe(full)
+        if doc is None:
+            print(f"[FAIL-OPEN] {file}")
+            continue
+
+        df=read_text_safe(doc)
+
+        if df.empty:
+            print(f"[EMPTY] {file}")
+            close_doc_safe(doc)
+            continue
+
+        rows=build_rows(df)
+
+        for row in rows:
+            for g in split_row_by_x(row):
+                p=parse_group(g)
+                if p and p["ITEM_NO"] and p["PART_NO"]:
+                    all_results.append(p)
+
+        close_doc_safe(doc)
+
+    df_final=pd.DataFrame(all_results)
+
+    # 🔥 TREE
+    df_relation = build_relation(df_final)
+
+    file=f"bom_tree_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+
+    with pd.ExcelWriter(file) as writer:
+        df_final.to_excel(writer, sheet_name="BOM_RAW", index=False)
+        df_relation.to_excel(writer, sheet_name="BOM_RELATION", index=False)
+
+    print("DONE", file)
+
+if __name__=="__main__":
+    main()
