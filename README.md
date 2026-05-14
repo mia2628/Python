@@ -72,13 +72,6 @@ AI
 - 여러 목표 Ao를 순회하는 target sweep 지원
 - 통합 trade-off map 생성
 
-### 3.4 OPUS10 입력자료 연계
-
-- 백만시간당 고장률을 연간 고장강도로 변환
-- QPA 반영
-- FLEET_SIZE 반영
-- 장비 기준 고장강도와 전체 수리부속 수요강도 분리
-
 ---
 
 ## 4. 입력파일
@@ -141,8 +134,6 @@ USE_COLAB_UPLOAD = True
 
 ### 6.1 고장률 단위 설정
 
-OPUS10 입력자료는 일반적으로 **백만시간당 고장률** 형태를 사용합니다.
-
 ```python
 FAILURE_RATE_UNIT = "per_million_hours"
 ANNUAL_OPERATING_HOURS = HOURS_PER_YEAR
@@ -172,34 +163,8 @@ annual_lambda = 0.005333 × 8760 / 1,000,000
 
 ---
 
-### 6.2 QPA 설정
 
-`QPA`는 **Quantity Per Assembly/Equipment**, 즉 장비 1대에 해당 품목이 몇 개 들어가는지를 의미합니다.
-
-```python
-APPLY_QPA_TO_FAILURE_RATE = True
-DEFAULT_QPA = 1.0
-```
-
-QPA 컬럼이 없으면 모든 품목의 QPA는 `1.0`으로 처리됩니다.
-
-```text
-장비 1대 기준 고장강도 = 품목 1개 기준 고장강도 × QPA
-```
-
-예시:
-
-```text
-품목 1개 기준 연간 고장강도 = 0.00005
-QPA = 10
-
-장비 1대 기준 연간 고장강도 = 0.00005 × 10
-                         = 0.0005
-```
-
----
-
-### 6.3 FLEET_SIZE 설정
+### 6.2 FLEET_SIZE 설정
 
 `FLEET_SIZE`는 전체 운용대수를 의미합니다.
 
@@ -216,29 +181,11 @@ FLEET_SIZE = 30.0
 ```text
 수리부속 수요강도 = 장비 1대 기준 고장강도 × FLEET_SIZE
 ```
-
 ---
 
-## 7. 모델 개선 단계
+## 8. 상세 설명
 
-본 모델은 아래 단계들을 거쳐 개선되었습니다.
-
-| 단계 | 수정 내용 | 목적 |
-|---:|---|---|
-| Step 1 | 진단표 추가 | 결과 원인 추적 |
-| Step 2 | 고장률 단위 변환 | OPUS10 입력자료 반영 |
-| Step 3 | QPA 반영 | 장비 기준 고장강도 산정 |
-| Step 4 | PMIN 완화 | 후보품목 과도 탈락 방지 |
-| Step 5 | lambda 분리 | Ao 계산과 수요 계산 분리 |
-| Step 6 | 리드타임 수요 기반 부족확률 | 재고부족 위험 현실화 |
-
----
-
-## 8. Step별 상세 설명
-
-### Step 1. 진단표 추가
-
-모델 결과가 왜 그렇게 나왔는지 확인하기 위해 품목별 진단 컬럼을 추가했습니다.
+ 품목별 진단 컬럼
 
 | 진단값 | 의미 |
 |---|---|
@@ -255,48 +202,7 @@ FLEET_SIZE = 30.0
 
 ---
 
-### Step 2. Failure_Rate 단위 변환
-
-OPUS10의 백만시간당 고장률을 연간 고장강도로 변환합니다.
-
-```python
-FR_all = Failure_Rate × ANNUAL_OPERATING_HOURS / 1_000_000
-```
-
-이 단계는 모델 논리를 바꾸는 것이 아니라, 입력 단위를 모델 내부 단위와 일치시키는 전처리 단계입니다.
-
----
-
-### Step 3. QPA 반영
-
-품목 1개 기준 고장강도를 장비 1대 기준 고장강도로 확장합니다.
-
-```python
-annual_fr_item = FR_model_used × (1 - PM_failure_gamma)
-annual_fr_system = annual_fr_item × QPA
-```
-
-| 변수 | 의미 |
-|---|---|
-| `annual_fr_item` | 품목 1개 기준 연간 고장강도 |
-| `PM_failure_gamma` | 예방정비에 따른 고장률 완화효과 |
-| `annual_fr_system` | 장비 1대 기준 연간 고장강도 |
-
----
-
-### Step 4. PMIN 후보선별 기준 완화
-
-OPUS10 고장률 변환 후 `p_need_2y`가 작아져 후보품목이 과도하게 탈락하는 문제를 완화합니다.
-
-```python
-PMIN = 0.01
-```
-
-`PMIN`은 후보품목으로 포함하기 위한 최소 필요확률 기준입니다.
-
----
-
-### Step 5. lambda_system / lambda_demand 분리
+### lambda_system / lambda_demand 분리
 
 Ao 계산용 고장강도와 수리부속 수요 계산용 고장강도를 분리합니다.
 
@@ -315,7 +221,7 @@ annual_fr_demand = annual_fr_system × FLEET_SIZE
 
 ---
 
-### Step 6. 리드타임 수요 기반 부족확률
+### 리드타임 수요 기반 부족확률
 
 기존에는 issue time 동안 수요가 재고를 초과할 확률을 부족확률로 보았습니다.
 
@@ -581,35 +487,7 @@ DRM으로 보호된 Excel 파일은 `pandas`가 읽지 못할 수 있습니다. 
 
 ---
 
-## 18. 권장 GitHub 파일 구조
-
-```text
-project/
-├── README.md
-├── nsga_step6_lead_time_shortage_integrated.py
-├── radar_1000_parts_bom.xlsx
-├── output/
-│   ├── summary_by_target.csv
-│   ├── integrated_solutions.csv
-│   ├── diagnostics_table.csv
-│   └── pareto_curve.png
-```
-
-| 파일 | 설명 |
-|---|---|
-| `README.md` | 모델 설명 문서 |
-| `nsga_step6_lead_time_shortage_integrated.py` | Step-6 기준 최종 분석 코드 |
-| `radar_1000_parts_bom.xlsx` | 입력 BOM 및 품목 데이터 |
-| `summary_by_target.csv` | 목표 Ao별 요약 결과 |
-| `integrated_solutions.csv` | 전체 target sweep 통합 해집합 |
-| `diagnostics_table.csv` | 품목별 진단표 |
-| `pareto_curve.png` | 비용-효과 Pareto 그래프 |
-
----
-
-## 19. 연구모형 설명 문장
-
-논문 또는 기술보고서에서는 다음과 같이 설명할 수 있습니다.
+## 18. 연구모형 설명
 
 > 본 연구모형은 OPUS10 형식의 백만시간당 고장률을 연간 고장강도로 변환하고, 장비대당 품목수량(QPA) 및 운용대수(FLEET_SIZE)를 반영하여 장비 기준 고장강도와 전체 운용대수 기준 수리부속 수요강도를 분리하였다. 이후 리드타임 동안의 포아송 수요를 기반으로 재고부족확률을 산정하고, NSGA-II 알고리즘을 이용하여 비용, 목표 운용가용도 미달량, 관리품목/재고수량 부담을 동시에 최소화하는 Pareto 최적 재고대안을 도출하였다.
 
@@ -619,7 +497,7 @@ project/
 
 ---
 
-## 20. 주요 약어 및 컬럼 용어집
+## 19. 주요 약어 및 컬럼 용어집
 
 | 용어 | 한글 의미 | 설명 |
 |---|---|---|
@@ -651,7 +529,7 @@ project/
 
 ---
 
-## 21. 라이선스
+## 20. 라이선스
 
 본 저장소의 라이선스는 사용자가 GitHub 정책에 맞게 별도 지정해야 합니다.
 
@@ -662,16 +540,3 @@ project/
 
 ---
 
-## 22. 작성 기준
-
-본 README는 **Step-6 기준 모델**을 설명합니다.
-
-Step-6 기준 핵심 특징은 다음과 같습니다.
-
-- OPUS10 백만시간당 고장률 변환
-- QPA 반영
-- PMIN 후보선별 완화
-- `lambda_system` / `lambda_demand` 분리
-- 리드타임 수요 기반 부족확률
-- NSGA-II 기반 Pareto 최적화
-- target Ao sweep 기반 통합 trade-off map
