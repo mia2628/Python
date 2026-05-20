@@ -1153,9 +1153,9 @@ def evaluate_one_solution(y_manage, sO, sI, sD):
 
     # R-4: Initial_Stock is treated as already-available O-level serviceable stock.
     # It reduces shortage probability but is not counted as newly purchased stock.
-    effective_sO = sO + initial_credit
+    effective_sO = sO.copy()
     effective_sI = sI.copy()
-    effective_sD = sD.copy()
+    effective_sD = sD + initial_credit
     effective_total_stock = effective_sO + effective_sI + effective_sD
     has_shortage_credit = (y_manage > 0) | (initial_credit > 0)
 
