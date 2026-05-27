@@ -9,12 +9,6 @@
 #   - AO_TARGET 하나만 고정하지 않고 AO_TARGET_GRID를 순회
 #   - 각 target에서 NSGA-II를 반복 수행
 #   - 결과를 합쳐 cost-Ao 통합 시각화
-#
-# [MAINTENANCE TIME POLICY UPDATE]
-#   - 예방정비 주기 입력 컬럼은 수리부속 소요 예측 계산에 반영하지 않는다.
-#   - 고장률은 입력 Failure_Rate를 단위 변환한 값과 QPA만으로 산정한다.
-#   - 수리시간/복원시간은 CM_Time_Hours, Replace_Time_H, Repair_TAT_H,
-#     Maint_Echelon(O/I/D) 보정에 의해 산정한다.
 # ============================================================
 
 import os
