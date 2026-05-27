@@ -2183,32 +2183,45 @@ diag_df = pd.DataFrame({
 # reported as zero in the final PBL initial-spare list.
 #
 # Policy logic:
-# - p_need_3y >= 0.95  -> minimum 1 unit
-# - lambda_demand_3y >= 5  -> minimum 2 units
-# - lambda_demand_3y >= 20 -> minimum 3 units
-# - lambda_demand_3y >= 50 -> minimum 5 units
+# - p_need_3y >= 0.95 -> minimum 2 units
+# - 1 <= lambda_demand_3y < 6  -> minimum floor(lambda_demand_3y) + 1 units
+#   Example: lambda_demand_3y = 1.xx -> minimum 2 units, 5.xx -> minimum 6 units
+# - 6 <= lambda_demand_3y < 50 -> minimum 8 units
+# - lambda_demand_3y >= 50 -> minimum 10 units
 # Final initial spare quantity = max(NSGA-II total_stock_best, policy_min_qty)
 # ------------------------------------------------------------
 POLICY_P_NEED_MIN_QTY_THRESHOLD = 0.95
-POLICY_LAMBDA_MIN_QTY_LEVELS = [
-    (50.0, 5, "LAMBDA_GE_50_MIN_5"),
-    (20.0, 3, "LAMBDA_GE_20_MIN_3"),
-    (5.0, 2, "LAMBDA_GE_5_MIN_2"),
-]
+POLICY_P_NEED_MIN_QTY = 2
+POLICY_LAMBDA_LOW_MIN = 1.0
+POLICY_LAMBDA_MID_MIN = 6.0
+POLICY_LAMBDA_HIGH_MIN = 50.0
+POLICY_LAMBDA_MID_MIN_QTY = 8
+POLICY_LAMBDA_HIGH_MIN_QTY = 10
 POLICY_HIGH_AO_IMPACT_RANK = 0.90
 
 policy_min_qty_from_pneed = np.where(
     diag_df["p_need_3y"].astype(float) >= POLICY_P_NEED_MIN_QTY_THRESHOLD,
-    1,
+    POLICY_P_NEED_MIN_QTY,
     0,
 ).astype(int)
 
 lambda_demand_for_policy = diag_df["lambda_demand_3y"].astype(float).to_numpy()
+lambda_demand_for_policy = np.nan_to_num(lambda_demand_for_policy, nan=0.0, posinf=0.0, neginf=0.0)
+lambda_demand_for_policy = np.clip(lambda_demand_for_policy, 0.0, None)
+
 policy_min_qty_from_lambda = np.zeros(len(diag_df), dtype=int)
-for threshold, min_qty, _ in POLICY_LAMBDA_MIN_QTY_LEVELS:
-    mask = lambda_demand_for_policy >= threshold
-    update_mask = mask & (min_qty > policy_min_qty_from_lambda)
-    policy_min_qty_from_lambda[update_mask] = int(min_qty)
+
+# 1.xx -> 2, 2.xx -> 3, ..., 5.xx -> 6
+low_lambda_mask = (lambda_demand_for_policy >= POLICY_LAMBDA_LOW_MIN) & (lambda_demand_for_policy < POLICY_LAMBDA_MID_MIN)
+policy_min_qty_from_lambda[low_lambda_mask] = (
+    np.floor(lambda_demand_for_policy[low_lambda_mask]).astype(int) + 1
+)
+
+# 6 <= lambda < 50 -> 8, lambda >= 50 -> 10
+mid_lambda_mask = (lambda_demand_for_policy >= POLICY_LAMBDA_MID_MIN) & (lambda_demand_for_policy < POLICY_LAMBDA_HIGH_MIN)
+policy_min_qty_from_lambda[mid_lambda_mask] = POLICY_LAMBDA_MID_MIN_QTY
+high_lambda_mask = lambda_demand_for_policy >= POLICY_LAMBDA_HIGH_MIN
+policy_min_qty_from_lambda[high_lambda_mask] = POLICY_LAMBDA_HIGH_MIN_QTY
 
 policy_min_qty = np.maximum(policy_min_qty_from_pneed, policy_min_qty_from_lambda).astype(int)
 
@@ -2223,15 +2236,15 @@ diag_df["policy_ao_impact_rank_basis"] = diag_df["ao_impact_rank"].astype(float)
 def _build_policy_reason(row):
     reasons = []
     if int(row["policy_min_qty_from_pneed"]) > 0:
-        reasons.append("P_NEED_GE_0.95_MIN_1")
+        reasons.append("P_NEED_GE_0.95_MIN_2")
 
     lam = float(row["lambda_demand_3y"])
-    if lam >= 50.0:
-        reasons.append("LAMBDA_GE_50_MIN_5")
-    elif lam >= 20.0:
-        reasons.append("LAMBDA_GE_20_MIN_3")
-    elif lam >= 5.0:
-        reasons.append("LAMBDA_GE_5_MIN_2")
+    if lam >= POLICY_LAMBDA_HIGH_MIN:
+        reasons.append("LAMBDA_GE_50_MIN_10")
+    elif lam >= POLICY_LAMBDA_MID_MIN:
+        reasons.append("LAMBDA_GE_6_TO_LT_50_MIN_8")
+    elif lam >= POLICY_LAMBDA_LOW_MIN:
+        reasons.append(f"LAMBDA_GE_1_TO_LT_6_MIN_{int(np.floor(lam)) + 1}")
 
     if int(row["policy_high_ao_impact_flag"]) > 0:
         reasons.append("AO_IMPACT_RANK_GE_0.90")
@@ -2274,8 +2287,10 @@ diag_df["policy_initial_spare_qty"] = diag_df["policy_min_qty"].astype(int)
 
 print("\n[PBL POLICY MINIMUM INITIAL SPARES]")
 print("policy rule: keep pure NSGA-II total_stock_best unchanged; final_initial_spare_qty=max(total_stock_best, policy_min_qty)")
-print(f"  p_need_3y >= {POLICY_P_NEED_MIN_QTY_THRESHOLD:.2f} -> min 1 unit")
-print("  lambda_demand_3y >= 5/20/50 -> min 2/3/5 units")
+print(f"  p_need_3y >= {POLICY_P_NEED_MIN_QTY_THRESHOLD:.2f} -> min {POLICY_P_NEED_MIN_QTY} units")
+print("  1 <= lambda_demand_3y < 6 -> min floor(lambda_demand_3y)+1 units, e.g. 1.xx -> 2")
+print(f"  {POLICY_LAMBDA_MID_MIN:.0f} <= lambda_demand_3y < {POLICY_LAMBDA_HIGH_MIN:.0f} -> min {POLICY_LAMBDA_MID_MIN_QTY} units")
+print(f"  lambda_demand_3y >= {POLICY_LAMBDA_HIGH_MIN:.0f} -> min {POLICY_LAMBDA_HIGH_MIN_QTY} units")
 print(f"  ao_impact_rank >= {POLICY_HIGH_AO_IMPACT_RANK:.2f} is reported as a high-impact policy basis flag")
 print(f"policy-min rows = {int((diag_df['policy_min_qty'] > 0).sum())}")
 print(f"policy-added rows = {int((diag_df['policy_added_qty'] > 0).sum())}")
