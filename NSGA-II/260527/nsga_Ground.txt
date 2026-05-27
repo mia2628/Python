@@ -29,7 +29,7 @@ if USE_COLAB_UPLOAD:
     uploaded = files.upload()
     XLSX_PATH = list(uploaded.keys())[0]
 else:
-    XLSX_PATH = "radar_1000_parts_bom.xlsx"
+    XLSX_PATH = "Ground_v2.xlsx"
 
 df = pd.read_excel(XLSX_PATH, sheet_name=0)
 print(f"[LOAD] shape = {df.shape}")
@@ -97,7 +97,7 @@ for c in [
 # ============================================================
 # 2) Settings
 # ============================================================
-YEARS = 3.0
+YEARS = 5.0
 T_OBS_HOURS = YEARS * 365.0 * 24.0
 HOURS_PER_YEAR = 365.0 * 24.0
 
