@@ -1,0 +1,984 @@
+# -*- coding: utf-8 -*-
+"""
+======================================================================
+NSGA-II Analysis Report - Excel Report Export Module
+======================================================================
+Purpose
+-------
+This module exports the results produced by
+`nsga_Ground_PERIOD_AoDT_FIXED_integrated.txt` to a polished XLSX report.
+
+IMPORTANT
+---------
+1) This module DOES NOT modify the NSGA-II model or optimization logic.
+2) Run the NSGA-II integrated code first in the SAME Jupyter kernel.
+3) Then execute this text module in the same namespace, e.g.:
+
+   exec(open("NSGA_Excel_Report_Export_Module.txt", encoding="utf-8").read(), globals())
+
+4) Default output:
+   nsga_outputs/NSGA_II_Analysis_Report.xlsx
+
+Required model variables
+------------------------
+- summary_by_target
+- df_all_runs
+- df_integrated
+- diag_df
+- res
+- b
+- YEARS, T_OBS_HOURS, REPRESENTATIVE_TARGET
+
+The module also reads optional model settings when they exist.
+======================================================================
+"""
+
+from __future__ import annotations
+
+import os
+from datetime import datetime
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+
+try:
+    import xlsxwriter
+except ImportError as exc:
+    raise ImportError(
+        "This Excel report module requires the 'xlsxwriter' package. "
+        "Install it with: pip install xlsxwriter"
+    ) from exc
+
+
+# ======================================================================
+# 0) Report settings - these affect Excel presentation only.
+# ======================================================================
+REPORT_OUTPUT_DIR = globals().get("OUTPUT_DIR", "nsga_outputs")
+REPORT_FILENAME = "NSGA_II_Analysis_Report.xlsx"
+REPORT_PATH = os.path.join(REPORT_OUTPUT_DIR, REPORT_FILENAME)
+
+REPORT_TITLE = "NSGA-II 초기수리부속 최적화 분석 보고서"
+REPORT_SUBTITLE = "Operational Availability · Cost · Downtime · Initial Spare Policy"
+REPORT_AUTHOR = "NSGA-II Analysis Model"
+
+# Set True if you want the workbook to open on the Executive sheet.
+ACTIVATE_EXECUTIVE_SHEET = True
+
+# Number of top parts shown in dashboard / analytical charts.
+TOP_N_PARTS = 15
+
+# Excel sheet names (<= 31 chars)
+SHEET_EXECUTIVE = "01_Executive"
+SHEET_TARGET = "02_Target_Summary"
+SHEET_PARETO = "03_Pareto_Solutions"
+SHEET_POLICY = "04_Best_Policy"
+SHEET_DIAG = "05_Part_Diagnostics"
+SHEET_DT = "06_DT_Analysis"
+SHEET_COST = "07_Cost_Analysis"
+SHEET_SETTINGS = "08_Model_Settings"
+
+
+# ======================================================================
+# 1) Color / style system
+# ======================================================================
+C = {
+    "navy": "#0B1F33",
+    "blue": "#246BFD",
+    "sky": "#EAF2FF",
+    "teal": "#14B8A6",
+    "green": "#22C55E",
+    "amber": "#F59E0B",
+    "red": "#EF4444",
+    "purple": "#7C3AED",
+    "ink": "#172033",
+    "text": "#344054",
+    "muted": "#667085",
+    "line": "#D9E2F0",
+    "panel": "#F7F9FC",
+    "white": "#FFFFFF",
+    "soft_green": "#ECFDF3",
+    "soft_red": "#FEF3F2",
+    "soft_amber": "#FFFAEB",
+    "soft_purple": "#F4F3FF",
+}
+
+
+# ======================================================================
+# 2) Helpers
+# ======================================================================
+def _require_globals(ns: Dict[str, Any], names: Sequence[str]) -> None:
+    missing = [name for name in names if name not in ns]
+    if missing:
+        raise RuntimeError(
+            "Excel report export requires the NSGA-II model to be executed first "
+            "in the same Jupyter kernel. Missing variables: " + ", ".join(missing)
+        )
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        v = float(value)
+        return v if np.isfinite(v) else default
+    except Exception:
+        return default
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(round(float(value)))
+    except Exception:
+        return default
+
+
+def _safe_div(a: float, b: float) -> float:
+    return float(a / b) if b not in (0, 0.0) and np.isfinite(b) else 0.0
+
+
+def _excel_col_width(series: pd.Series, header: str, min_w: int = 10, max_w: int = 34) -> int:
+    if len(series) == 0:
+        return max(min_w, min(max_w, len(str(header)) + 2))
+    sample = series.astype(str).replace("nan", "").head(1000)
+    max_len = max([len(str(header))] + [len(x) for x in sample.tolist()])
+    return max(min_w, min(max_w, max_len + 2))
+
+
+def _make_formats(workbook: xlsxwriter.Workbook) -> Dict[str, Any]:
+    return {
+        "title": workbook.add_format({
+            "font_name": "Aptos Display", "font_size": 22, "bold": True,
+            "font_color": C["white"], "bg_color": C["navy"],
+            "align": "left", "valign": "vcenter"
+        }),
+        "subtitle": workbook.add_format({
+            "font_name": "Aptos", "font_size": 10, "font_color": "#D6E4F0",
+            "bg_color": C["navy"], "align": "left", "valign": "vcenter"
+        }),
+        "section": workbook.add_format({
+            "font_name": "Aptos Display", "font_size": 13, "bold": True,
+            "font_color": C["ink"], "bg_color": C["sky"],
+            "bottom": 1, "bottom_color": C["blue"], "valign": "vcenter"
+        }),
+        "kpi_label": workbook.add_format({
+            "font_name": "Aptos", "font_size": 9, "bold": True,
+            "font_color": C["muted"], "bg_color": C["white"],
+            "align": "left", "valign": "vcenter",
+            "top": 1, "bottom": 0, "left": 1, "right": 1,
+            "border_color": C["line"]
+        }),
+        "kpi_value": workbook.add_format({
+            "font_name": "Aptos Display", "font_size": 18, "bold": True,
+            "font_color": C["navy"], "bg_color": C["white"],
+            "align": "left", "valign": "vcenter",
+            "top": 0, "bottom": 1, "left": 1, "right": 1,
+            "border_color": C["line"]
+        }),
+        "kpi_percent": workbook.add_format({
+            "font_name": "Aptos Display", "font_size": 18, "bold": True,
+            "font_color": C["blue"], "bg_color": C["white"],
+            "align": "left", "valign": "vcenter", "num_format": "0.00%",
+            "top": 0, "bottom": 1, "left": 1, "right": 1,
+            "border_color": C["line"]
+        }),
+        "kpi_money": workbook.add_format({
+            "font_name": "Aptos Display", "font_size": 16, "bold": True,
+            "font_color": C["teal"], "bg_color": C["white"],
+            "align": "left", "valign": "vcenter", "num_format": '#,##0,"천원"',
+            "top": 0, "bottom": 1, "left": 1, "right": 1,
+            "border_color": C["line"]
+        }),
+        "kpi_number": workbook.add_format({
+            "font_name": "Aptos Display", "font_size": 18, "bold": True,
+            "font_color": C["purple"], "bg_color": C["white"],
+            "align": "left", "valign": "vcenter", "num_format": "#,##0",
+            "top": 0, "bottom": 1, "left": 1, "right": 1,
+            "border_color": C["line"]
+        }),
+        "note": workbook.add_format({
+            "font_name": "Aptos", "font_size": 9, "font_color": C["muted"],
+            "bg_color": C["panel"], "text_wrap": True, "valign": "top",
+            "border": 1, "border_color": C["line"]
+        }),
+        "header": workbook.add_format({
+            "font_name": "Aptos", "font_size": 9, "bold": True,
+            "font_color": C["white"], "bg_color": C["navy"],
+            "align": "center", "valign": "vcenter", "text_wrap": True,
+            "border": 1, "border_color": "#27445E"
+        }),
+        "subheader": workbook.add_format({
+            "font_name": "Aptos", "font_size": 9, "bold": True,
+            "font_color": C["ink"], "bg_color": C["sky"],
+            "align": "center", "valign": "vcenter", "text_wrap": True,
+            "border": 1, "border_color": C["line"]
+        }),
+        "text": workbook.add_format({
+            "font_name": "Aptos", "font_size": 9, "font_color": C["text"],
+            "valign": "vcenter"
+        }),
+        "text_wrap": workbook.add_format({
+            "font_name": "Aptos", "font_size": 9, "font_color": C["text"],
+            "valign": "top", "text_wrap": True
+        }),
+        "int": workbook.add_format({
+            "font_name": "Aptos", "font_size": 9, "font_color": C["text"],
+            "num_format": "#,##0", "align": "right"
+        }),
+        "decimal": workbook.add_format({
+            "font_name": "Aptos", "font_size": 9, "font_color": C["text"],
+            "num_format": "#,##0.0000", "align": "right"
+        }),
+        "hours": workbook.add_format({
+            "font_name": "Aptos", "font_size": 9, "font_color": C["text"],
+            "num_format": '#,##0.00 "h"', "align": "right"
+        }),
+        "percent": workbook.add_format({
+            "font_name": "Aptos", "font_size": 9, "font_color": C["text"],
+            "num_format": "0.00%", "align": "right"
+        }),
+        "money": workbook.add_format({
+            "font_name": "Aptos", "font_size": 9, "font_color": C["text"],
+            "num_format": '#,##0 "원"', "align": "right"
+        }),
+        "money_bold": workbook.add_format({
+            "font_name": "Aptos", "font_size": 9, "bold": True,
+            "font_color": C["ink"], "num_format": '#,##0 "원"', "align": "right"
+        }),
+        "good": workbook.add_format({
+            "font_name": "Aptos", "font_size": 9, "bold": True,
+            "font_color": "#067647", "bg_color": C["soft_green"],
+            "align": "center"
+        }),
+        "bad": workbook.add_format({
+            "font_name": "Aptos", "font_size": 9, "bold": True,
+            "font_color": "#B42318", "bg_color": C["soft_red"],
+            "align": "center"
+        }),
+        "warning": workbook.add_format({
+            "font_name": "Aptos", "font_size": 9, "bold": True,
+            "font_color": "#B54708", "bg_color": C["soft_amber"],
+            "align": "center"
+        }),
+        "small_muted": workbook.add_format({
+            "font_name": "Aptos", "font_size": 8, "font_color": C["muted"]
+        }),
+        "label": workbook.add_format({
+            "font_name": "Aptos", "font_size": 9, "bold": True,
+            "font_color": C["muted"], "bg_color": C["panel"],
+            "border": 1, "border_color": C["line"]
+        }),
+        "value": workbook.add_format({
+            "font_name": "Aptos", "font_size": 9, "font_color": C["ink"],
+            "bg_color": C["white"], "border": 1, "border_color": C["line"]
+        }),
+    }
+
+
+def _write_title(ws: xlsxwriter.worksheet.Worksheet, fmt: Dict[str, Any], title: str, subtitle: str = "") -> None:
+    ws.set_row(0, 34)
+    ws.merge_range("A1:N1", title, fmt["title"])
+    ws.set_row(1, 20)
+    ws.merge_range("A2:N2", subtitle, fmt["subtitle"])
+    ws.hide_gridlines(2)
+
+
+def _write_section(ws: xlsxwriter.worksheet.Worksheet, fmt: Dict[str, Any], row: int, title: str, last_col: int = 13) -> None:
+    ws.set_row(row, 22)
+    ws.merge_range(row, 0, row, last_col, title, fmt["section"])
+
+
+def _write_kpi(
+    ws: xlsxwriter.worksheet.Worksheet,
+    fmt: Dict[str, Any],
+    top_row: int,
+    left_col: int,
+    label: str,
+    value: Any,
+    kind: str = "number",
+    span: int = 2,
+) -> None:
+    right_col = left_col + span - 1
+    ws.merge_range(top_row, left_col, top_row, right_col, label, fmt["kpi_label"])
+    f = {
+        "percent": fmt["kpi_percent"],
+        "money": fmt["kpi_money"],
+        "number": fmt["kpi_number"],
+        "text": fmt["kpi_value"],
+    }.get(kind, fmt["kpi_value"])
+    ws.merge_range(top_row + 1, left_col, top_row + 2, right_col, value, f)
+    ws.set_row(top_row, 18)
+    ws.set_row(top_row + 1, 23)
+    ws.set_row(top_row + 2, 23)
+
+
+def _format_dataframe_columns(
+    ws: xlsxwriter.worksheet.Worksheet,
+    df: pd.DataFrame,
+    start_row: int,
+    start_col: int,
+    formats: Dict[str, Any],
+) -> None:
+    for j, col in enumerate(df.columns):
+        col_l = str(col).lower()
+        series = df[col]
+        width = _excel_col_width(series, str(col))
+        cell_format = formats["text"]
+
+        if any(k in col_l for k in ["cost", "price", "spend", "krw"]):
+            cell_format = formats["money"]
+            width = max(width, 15)
+        elif col_l == "ao" or col_l.startswith("ao_") and any(k in col_l for k in ["share", "ratio"]):
+            cell_format = formats["percent"]
+            width = max(width, 12)
+        elif any(k in col_l for k in ["ratio", "share_ge", "p_need", "p_short"]):
+            cell_format = formats["percent"]
+            width = max(width, 12)
+        elif any(k in col_l for k in ["_h", "hours", "wait", "restore", "diag", "t_obs"]):
+            if pd.api.types.is_numeric_dtype(series):
+                cell_format = formats["hours"]
+                width = max(width, 13)
+        elif pd.api.types.is_integer_dtype(series):
+            cell_format = formats["int"]
+        elif pd.api.types.is_numeric_dtype(series):
+            cell_format = formats["decimal"]
+        elif any(k in col_l for k in ["reason", "source"]):
+            cell_format = formats["text_wrap"]
+            width = max(width, 22)
+
+        ws.set_column(start_col + j, start_col + j, width, cell_format)
+
+
+def _write_df_table(
+    workbook: xlsxwriter.Workbook,
+    ws: xlsxwriter.worksheet.Worksheet,
+    df: pd.DataFrame,
+    start_row: int,
+    start_col: int,
+    table_name: str,
+    formats: Dict[str, Any],
+    max_rows: Optional[int] = None,
+) -> Tuple[int, int]:
+    work_df = df.copy()
+    if max_rows is not None:
+        work_df = work_df.head(max_rows).copy()
+
+    # Normalize NaN/Inf for Excel stability.
+    work_df = work_df.replace([np.inf, -np.inf], np.nan)
+
+    nrows, ncols = work_df.shape
+    if ncols == 0:
+        return start_row, start_col
+
+    # Header
+    for j, col in enumerate(work_df.columns):
+        ws.write(start_row, start_col + j, str(col), formats["header"])
+
+    # Data
+    for i, row in enumerate(work_df.itertuples(index=False, name=None), start=1):
+        for j, val in enumerate(row):
+            if pd.isna(val):
+                ws.write_blank(start_row + i, start_col + j, None)
+            elif isinstance(val, (np.integer, int)) and not isinstance(val, bool):
+                ws.write_number(start_row + i, start_col + j, int(val))
+            elif isinstance(val, (np.floating, float)):
+                ws.write_number(start_row + i, start_col + j, float(val))
+            else:
+                ws.write(start_row + i, start_col + j, str(val))
+
+    if nrows > 0:
+        ws.add_table(
+            start_row,
+            start_col,
+            start_row + nrows,
+            start_col + ncols - 1,
+            {
+                "name": table_name,
+                "style": "Table Style Medium 2",
+                "columns": [{"header": str(c)} for c in work_df.columns],
+            },
+        )
+    _format_dataframe_columns(ws, work_df, start_row, start_col, formats)
+    ws.set_row(start_row, 34)
+    return start_row + nrows, start_col + ncols - 1
+
+
+def _chart_style(chart: Any, title: str, x_name: str = "", y_name: str = "") -> None:
+    chart.set_title({"name": title, "name_font": {"name": "Aptos Display", "size": 12, "bold": True, "color": C["ink"]}})
+    chart.set_chartarea({"border": {"none": True}, "fill": {"color": C["white"]}})
+    chart.set_plotarea({"border": {"color": C["line"]}, "fill": {"color": C["white"]}})
+    chart.set_legend({"font": {"name": "Aptos", "size": 9, "color": C["muted"]}, "position": "bottom"})
+    chart.set_x_axis({
+        "name": x_name,
+        "name_font": {"name": "Aptos", "size": 9, "bold": True, "color": C["text"]},
+        "num_font": {"name": "Aptos", "size": 8, "color": C["muted"]},
+        "line": {"color": C["line"]},
+        "major_gridlines": {"visible": False},
+    })
+    chart.set_y_axis({
+        "name": y_name,
+        "name_font": {"name": "Aptos", "size": 9, "bold": True, "color": C["text"]},
+        "num_font": {"name": "Aptos", "size": 8, "color": C["muted"]},
+        "line": {"color": C["line"]},
+        "major_gridlines": {"visible": True, "line": {"color": "#E9EEF5"}},
+    })
+
+
+def _pick_representative_best_row(df_all_runs: pd.DataFrame, target: float) -> pd.Series:
+    g = df_all_runs[np.isclose(df_all_runs["target_ao"].astype(float), float(target))].copy()
+    if g.empty:
+        g = df_all_runs.copy()
+    feasible = g[g["Ao"].astype(float) >= float(target)].copy()
+    if not feasible.empty:
+        return feasible.sort_values(["total_cost", "Ao"], ascending=[True, False]).iloc[0]
+    return g.sort_values(["Ao", "total_cost"], ascending=[False, True]).iloc[0]
+
+
+def _collect_settings(ns: Dict[str, Any]) -> pd.DataFrame:
+    setting_names = [
+        "YEARS", "HOURS_PER_YEAR", "T_OBS_HOURS", "FAILURE_RATE_UNIT",
+        "ANNUAL_OPERATING_HOURS", "APPLY_QPA_TO_FAILURE_RATE", "DEFAULT_QPA",
+        "FLEET_SIZE", "SHORTAGE_PROB_MODE", "LEAD_TIME_SHORTAGE_FLOOR_H",
+        "USE_LEAD_TIME_FOR_STOCK_CAP", "APPLY_REPAIRABLE_TIME_SPLIT",
+        "APPLY_REPAIRABLE_STOCK_CAP", "STOCK_CAP_SAFETY_Z", "STOCK_CAP_BUFFER_UNITS",
+        "AO_TARGET_GRID", "REPRESENTATIVE_TARGET", "AO_LINES",
+        "P_NEED_MIN", "LONG_LEAD_PERCENTILE", "AO_IMPACT_PERCENTILE",
+        "LONG_CORE_IMPACT_PERCENTILE", "POP", "GEN", "SEED",
+        "AO_COST_PENALTY", "h_pre", "D_ONLY_PBL_STOCK", "USE_I_LEVEL_STOCK",
+        "POLICY_P_NEED_MIN_QTY_THRESHOLD", "POLICY_P_NEED_MIN_QTY",
+        "POLICY_LAMBDA_LOW_MIN", "POLICY_LAMBDA_MID_MIN", "POLICY_LAMBDA_HIGH_MIN",
+        "POLICY_LAMBDA_MID_MIN_QTY", "POLICY_LAMBDA_HIGH_MIN_QTY",
+        "POLICY_HIGH_AO_IMPACT_RANK", "XLSX_PATH",
+    ]
+    rows = []
+    for name in setting_names:
+        if name in ns:
+            val = ns[name]
+            if isinstance(val, (list, tuple, np.ndarray)):
+                val = ", ".join(map(str, list(val)))
+            rows.append({"Setting": name, "Value": val})
+    rows.extend([
+        {"Setting": "REPORT_GENERATED_AT", "Value": datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
+        {"Setting": "REPORT_MODULE", "Value": "NSGA_Excel_Report_Export_Module"},
+    ])
+    return pd.DataFrame(rows)
+
+
+# ======================================================================
+# 3) Main exporter
+# ======================================================================
+def export_nsga_excel_report(
+    output_path: Optional[str] = None,
+    namespace: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Create a polished XLSX report from the executed NSGA-II model results."""
+
+    ns = namespace if namespace is not None else globals()
+    required = ["summary_by_target", "df_all_runs", "df_integrated", "diag_df", "res", "b"]
+    _require_globals(ns, required)
+
+    summary_by_target = ns["summary_by_target"].copy()
+    df_all_runs = ns["df_all_runs"].copy()
+    df_integrated = ns["df_integrated"].copy()
+    diag_df = ns["diag_df"].copy()
+    res = ns["res"]
+    b = ns["b"]
+
+    years = _safe_float(ns.get("YEARS", b.get("analysis_years", 0.0)))
+    t_obs_h = _safe_float(ns.get("T_OBS_HOURS", b.get("T_obs_h", 0.0)))
+    rep_target = _safe_float(ns.get("REPRESENTATIVE_TARGET", res.get("target_ao", 0.0)))
+
+    output_path = output_path or REPORT_PATH
+    output_dir = os.path.dirname(output_path) or "."
+    os.makedirs(output_dir, exist_ok=True)
+
+    # ------------------------------------------------------------------
+    # Derived report datasets
+    # ------------------------------------------------------------------
+    best_ao = _safe_float(b.get("Ao", res.get("best_Ao", 0.0)))
+    target_met = best_ao >= rep_target
+
+    # Final-policy quantities include the policy overlay, while pure NSGA values remain separate.
+    final_initial_rows = _safe_int((diag_df.get("final_initial_spare_qty", pd.Series(dtype=float)) > 0).sum()) if "final_initial_spare_qty" in diag_df else 0
+    final_initial_units = _safe_int(diag_df.get("final_initial_spare_qty", pd.Series(dtype=float)).sum()) if "final_initial_spare_qty" in diag_df else 0
+    policy_added_units = _safe_int(diag_df.get("policy_added_qty", pd.Series(dtype=float)).sum()) if "policy_added_qty" in diag_df else 0
+    policy_added_rows = _safe_int((diag_df.get("policy_added_qty", pd.Series(dtype=float)) > 0).sum()) if "policy_added_qty" in diag_df else 0
+
+    stock_cost = _safe_float(b.get("stock_cost", 0.0))
+    hold_cost = _safe_float(b.get("hold_cost", 0.0))
+    total_cost = _safe_float(b.get("total_cost", 0.0))
+    base_maint_spend = _safe_float(ns.get("BASE_MAINT_SPEND", max(total_cost - stock_cost - hold_cost, 0.0)))
+
+    dt_diag_annual = _safe_float(b.get("DT_diag_annual_h", 0.0))
+    dt_wait_annual = _safe_float(b.get("DT_wait_annual_h", 0.0))
+    dt_restore_annual = _safe_float(b.get("DT_restore_annual_h", 0.0))
+    dt_total_annual = _safe_float(b.get("DT_total_annual_h", dt_diag_annual + dt_wait_annual + dt_restore_annual))
+    dt_diag = _safe_float(b.get("DT_diag_h", dt_diag_annual * years))
+    dt_wait = _safe_float(b.get("DT_wait_h", dt_wait_annual * years))
+    dt_restore = _safe_float(b.get("DT_restore_h", dt_restore_annual * years))
+    dt_total = _safe_float(b.get("DT_total_h", dt_diag + dt_wait + dt_restore))
+
+    dt_analysis = pd.DataFrame([
+        {"DT_Component": "Diagnosis", "Annual_DT_h": dt_diag_annual, "Period_DT_h": dt_diag, "Share": _safe_div(dt_diag, dt_total)},
+        {"DT_Component": "Stock/Logistics Wait", "Annual_DT_h": dt_wait_annual, "Period_DT_h": dt_wait, "Share": _safe_div(dt_wait, dt_total)},
+        {"DT_Component": "Restore/Repair", "Annual_DT_h": dt_restore_annual, "Period_DT_h": dt_restore, "Share": _safe_div(dt_restore, dt_total)},
+        {"DT_Component": "TOTAL", "Annual_DT_h": dt_total_annual, "Period_DT_h": dt_total, "Share": 1.0 if dt_total > 0 else 0.0},
+    ])
+
+    cost_analysis = pd.DataFrame([
+        {"Cost_Component": "Initial Stock Cost", "Amount_KRW": stock_cost, "Share": _safe_div(stock_cost, total_cost)},
+        {"Cost_Component": "Holding Cost", "Amount_KRW": hold_cost, "Share": _safe_div(hold_cost, total_cost)},
+        {"Cost_Component": "Expected Maintenance Spend", "Amount_KRW": base_maint_spend, "Share": _safe_div(base_maint_spend, total_cost)},
+        {"Cost_Component": "TOTAL", "Amount_KRW": total_cost, "Share": 1.0 if total_cost > 0 else 0.0},
+    ])
+
+    # Best feasible/near-feasible solution by target for a compact decision table.
+    decision_rows = []
+    for target in sorted(summary_by_target["target_ao"].dropna().astype(float).unique()):
+        row = _pick_representative_best_row(df_all_runs, target)
+        decision_rows.append({
+            "target_ao": target,
+            "selected_Ao": _safe_float(row.get("Ao")),
+            "target_met": "YES" if _safe_float(row.get("Ao")) >= target else "NO",
+            "total_cost": _safe_float(row.get("total_cost")),
+            "stock_cost": _safe_float(row.get("stock_cost")),
+            "hold_cost": _safe_float(row.get("hold_cost")),
+            "DT_total_h": _safe_float(row.get("DT_total_h")),
+            "DT_wait_h": _safe_float(row.get("DT_wait_h")),
+            "managed_items": _safe_int(row.get("managed_items")),
+            "purchase_stock_units": _safe_int(row.get("purchase_stock_units")),
+            "residual_shortage_exposure_total": _safe_float(row.get("residual_shortage_exposure_total")),
+        })
+    decision_df = pd.DataFrame(decision_rows)
+
+    # Pareto-only table, keeping every field available for traceability.
+    pareto_df = df_all_runs[df_all_runs.get("is_pareto_2d", 0).astype(int) == 1].copy() if "is_pareto_2d" in df_all_runs else df_all_runs.copy()
+    pareto_df = pareto_df.sort_values(["target_ao", "total_cost", "Ao"], ascending=[True, True, False]).reset_index(drop=True)
+
+    # Best-policy part list.
+    if "final_initial_spare_qty" in diag_df.columns:
+        best_policy_df = diag_df[diag_df["final_initial_spare_qty"].astype(float) > 0].copy()
+        best_policy_df = best_policy_df.sort_values(
+            ["final_initial_spare_qty", "lambda_demand_period", "ao_impact_rank"],
+            ascending=[False, False, False],
+        )
+    else:
+        best_policy_df = diag_df.copy()
+
+    policy_cols = [c for c in [
+        "Part_ID", "Parent_ID", "Level", "Depth", "Maint_Echelon",
+        "Repairable_Flag", "unit_proc_cost", "annual_FR_system", "annual_FR_demand",
+        "lambda_system_period", "lambda_demand_period", "p_need_period",
+        "ao_impact", "ao_impact_rank", "baseline_wait_h", "shortage_exposure_h",
+        "selected_manage", "sD_best", "total_stock_best", "purchase_stock_best_detail",
+        "policy_min_qty", "policy_added_qty", "final_initial_spare_qty",
+        "final_initial_spare_stock_cost", "final_initial_spare_hold_cost",
+        "initial_spare_source", "policy_reason"
+    ] if c in best_policy_df.columns]
+    best_policy_view = best_policy_df[policy_cols].copy() if policy_cols else best_policy_df.copy()
+
+    # Top Ao impact parts for dashboard chart.
+    impact_cols = [c for c in ["Part_ID", "ao_impact", "ao_impact_rank", "final_initial_spare_qty", "unit_proc_cost"] if c in diag_df.columns]
+    if "ao_impact" in diag_df.columns and impact_cols:
+        top_impact = diag_df[impact_cols].sort_values("ao_impact", ascending=False).head(TOP_N_PARTS).copy()
+    else:
+        top_impact = pd.DataFrame(columns=impact_cols)
+
+    settings_df = _collect_settings(ns)
+
+    # ------------------------------------------------------------------
+    # Workbook
+    # ------------------------------------------------------------------
+    workbook = xlsxwriter.Workbook(output_path, {"nan_inf_to_errors": True})
+    workbook.set_properties({
+        "title": REPORT_TITLE,
+        "subject": "NSGA-II initial spare optimization analysis report",
+        "author": REPORT_AUTHOR,
+        "company": "",
+        "comments": "Generated from nsga_Ground_PERIOD_AoDT_FIXED_integrated results.",
+    })
+    fmt = _make_formats(workbook)
+
+    # ==================================================================
+    # 01 Executive Dashboard
+    # ==================================================================
+    ws = workbook.add_worksheet(SHEET_EXECUTIVE)
+    if ACTIVATE_EXECUTIVE_SHEET:
+        ws.activate()
+    ws.set_tab_color(C["blue"])
+    _write_title(ws, fmt, REPORT_TITLE, f"{REPORT_SUBTITLE}  |  Generated {datetime.now():%Y-%m-%d %H:%M}")
+    ws.set_column("A:A", 2)
+    ws.set_column("B:M", 14)
+    ws.set_column("N:N", 2)
+    ws.freeze_panes(3, 0)
+
+    _write_section(ws, fmt, 3, "Executive KPI", 13)
+    _write_kpi(ws, fmt, 5, 1, "분석기간", f"{years:g} Years", "text", 2)
+    _write_kpi(ws, fmt, 5, 3, "대표 목표 Ao", rep_target, "percent", 2)
+    _write_kpi(ws, fmt, 5, 5, "최종 Ao", best_ao, "percent", 2)
+    _write_kpi(ws, fmt, 5, 7, "목표 달성", "YES" if target_met else "NO", "text", 2)
+    _write_kpi(ws, fmt, 5, 9, "총 비용", total_cost / 1000.0, "money", 2)
+    _write_kpi(ws, fmt, 5, 11, "기간 총 DT", dt_total, "number", 2)
+
+    _write_kpi(ws, fmt, 9, 1, "후보 부품 수", len(diag_df), "number", 2)
+    _write_kpi(ws, fmt, 9, 3, "관리 품목 수", _safe_int(b.get("managed_items", 0)), "number", 2)
+    _write_kpi(ws, fmt, 9, 5, "NSGA 재고 수량", _safe_int(b.get("total_stock_units", 0)), "number", 2)
+    _write_kpi(ws, fmt, 9, 7, "최종 초기수리부속 품목", final_initial_rows, "number", 2)
+    _write_kpi(ws, fmt, 9, 9, "최종 초기수리부속 수량", final_initial_units, "number", 2)
+    _write_kpi(ws, fmt, 9, 11, "정책 추가 수량", policy_added_units, "number", 2)
+
+    # Decision interpretation note
+    _write_section(ws, fmt, 13, "Decision Snapshot", 13)
+    insight = (
+        f"대표 목표 Ao {rep_target:.2%} 대비 최종 Ao는 {best_ao:.2%}로 "
+        f"{'목표를 충족합니다.' if target_met else '목표에 미달합니다.'} "
+        f"분석기간 {years:g}년의 총 DT는 {dt_total:,.1f}시간이며, "
+        f"그중 재고/물류 대기 DT 비중은 {_safe_div(dt_wait, dt_total):.1%}입니다. "
+        f"순수 NSGA-II 재고와 정책 최소수량을 결합한 최종 초기수리부속은 "
+        f"{final_initial_rows:,}종 / {final_initial_units:,}개입니다."
+    )
+    ws.merge_range("B15:M17", insight, fmt["note"])
+
+    # Hidden chart data on executive sheet
+    chart_start = 45
+    ws.write(chart_start, 1, "DT_Component", fmt["header"])
+    ws.write(chart_start, 2, "Period_DT_h", fmt["header"])
+    for i, row in dt_analysis.iloc[:3].iterrows():
+        ws.write(chart_start + 1 + i, 1, row["DT_Component"])
+        ws.write_number(chart_start + 1 + i, 2, float(row["Period_DT_h"]))
+
+    ws.write(chart_start, 4, "Cost_Component", fmt["header"])
+    ws.write(chart_start, 5, "Amount_KRW", fmt["header"])
+    for i, row in cost_analysis.iloc[:3].iterrows():
+        ws.write(chart_start + 1 + i, 4, row["Cost_Component"])
+        ws.write_number(chart_start + 1 + i, 5, float(row["Amount_KRW"]))
+
+    chart_dt = workbook.add_chart({"type": "doughnut"})
+    chart_dt.add_series({
+        "name": "DT 구성",
+        "categories": [SHEET_EXECUTIVE, chart_start + 1, 1, chart_start + 3, 1],
+        "values": [SHEET_EXECUTIVE, chart_start + 1, 2, chart_start + 3, 2],
+        "points": [
+            {"fill": {"color": C["blue"]}},
+            {"fill": {"color": C["amber"]}},
+            {"fill": {"color": C["teal"]}},
+        ],
+        "data_labels": {"percentage": True, "leader_lines": True, "font": {"name": "Aptos", "size": 9}},
+    })
+    chart_dt.set_hole_size(60)
+    _chart_style(chart_dt, "기간 DT 구성")
+    chart_dt.set_legend({"position": "bottom", "font": {"name": "Aptos", "size": 8}})
+    ws.insert_chart("B19", chart_dt, {"x_scale": 1.15, "y_scale": 1.0})
+
+    chart_cost = workbook.add_chart({"type": "doughnut"})
+    chart_cost.add_series({
+        "name": "비용 구성",
+        "categories": [SHEET_EXECUTIVE, chart_start + 1, 4, chart_start + 3, 4],
+        "values": [SHEET_EXECUTIVE, chart_start + 1, 5, chart_start + 3, 5],
+        "points": [
+            {"fill": {"color": C["blue"]}},
+            {"fill": {"color": C["purple"]}},
+            {"fill": {"color": C["teal"]}},
+        ],
+        "data_labels": {"percentage": True, "leader_lines": True, "font": {"name": "Aptos", "size": 9}},
+    })
+    chart_cost.set_hole_size(60)
+    _chart_style(chart_cost, "비용 구성")
+    chart_cost.set_legend({"position": "bottom", "font": {"name": "Aptos", "size": 8}})
+    ws.insert_chart("H19", chart_cost, {"x_scale": 1.15, "y_scale": 1.0})
+
+    # Cost-Ao trade-off chart using decision table written far below and hidden.
+    trade_start = chart_start + 7
+    trade_cols = ["target_ao", "selected_Ao", "total_cost"]
+    for j, col in enumerate(trade_cols):
+        ws.write(trade_start, 1 + j, col, fmt["header"])
+    for i, row in decision_df.iterrows():
+        ws.write_number(trade_start + 1 + i, 1, float(row["target_ao"]))
+        ws.write_number(trade_start + 1 + i, 2, float(row["selected_Ao"]))
+        ws.write_number(trade_start + 1 + i, 3, float(row["total_cost"]))
+
+    chart_trade = workbook.add_chart({"type": "scatter", "subtype": "straight_with_markers"})
+    n_dec = len(decision_df)
+    if n_dec > 0:
+        chart_trade.add_series({
+            "name": "Cost-Ao Trade-off",
+            "categories": [SHEET_EXECUTIVE, trade_start + 1, 3, trade_start + n_dec, 3],
+            "values": [SHEET_EXECUTIVE, trade_start + 1, 2, trade_start + n_dec, 2],
+            "line": {"color": C["blue"], "width": 2.0},
+            "marker": {"type": "circle", "size": 6, "border": {"color": C["blue"]}, "fill": {"color": C["white"]}},
+        })
+    _chart_style(chart_trade, "Cost vs Ao Trade-off", "Total Cost (KRW)", "Ao")
+    chart_trade.set_y_axis({"name": "Ao", "num_format": "0.0%", "min": max(0, min(decision_df["selected_Ao"].min() - 0.02, 0.98)) if n_dec else 0})
+    chart_trade.set_x_axis({"name": "Total Cost (KRW)", "num_format": "#,##0,,\"M\""})
+    ws.insert_chart("B35", chart_trade, {"x_scale": 2.0, "y_scale": 1.05})
+
+    # Hide raw chart support rows.
+    ws.set_row(chart_start, None, None, {"hidden": True})
+    for rr in range(chart_start + 1, trade_start + max(n_dec, 4) + 2):
+        ws.set_row(rr, None, None, {"hidden": True})
+
+    # ==================================================================
+    # 02 Target Summary
+    # ==================================================================
+    ws = workbook.add_worksheet(SHEET_TARGET)
+    ws.set_tab_color(C["teal"])
+    _write_title(ws, fmt, "목표 Ao별 분석 요약", "각 목표 Ao에서의 탐색범위와 의사결정용 대표 해를 비교합니다.")
+    ws.freeze_panes(5, 0)
+    _write_section(ws, fmt, 3, "Target Sweep Summary", 13)
+
+    target_view = summary_by_target.copy()
+    _write_df_table(workbook, ws, target_view, 5, 0, "TargetSummaryTable", fmt)
+
+    # Decision table under target summary
+    d_start = 8 + len(target_view)
+    _write_section(ws, fmt, d_start, "Decision-oriented Selected Solution by Target", 13)
+    _write_df_table(workbook, ws, decision_df, d_start + 2, 0, "DecisionByTargetTable", fmt)
+
+    # Conditional formatting
+    if len(decision_df) > 0:
+        headers = list(decision_df.columns)
+        ao_col = headers.index("selected_Ao")
+        met_col = headers.index("target_met")
+        cost_col = headers.index("total_cost")
+        first = d_start + 3
+        last = d_start + 2 + len(decision_df)
+        ws.conditional_format(first, ao_col, last, ao_col, {"type": "3_color_scale", "min_color": "#FEE2E2", "mid_color": "#FEF3C7", "max_color": "#DCFCE7"})
+        ws.conditional_format(first, cost_col, last, cost_col, {"type": "data_bar", "bar_color": C["blue"]})
+        ws.conditional_format(first, met_col, last, met_col, {"type": "text", "criteria": "containing", "value": "YES", "format": fmt["good"]})
+        ws.conditional_format(first, met_col, last, met_col, {"type": "text", "criteria": "containing", "value": "NO", "format": fmt["bad"]})
+
+    # ==================================================================
+    # 03 Pareto Solutions
+    # ==================================================================
+    ws = workbook.add_worksheet(SHEET_PARETO)
+    ws.set_tab_color(C["purple"])
+    _write_title(ws, fmt, "Pareto 최적해", "비용과 Ao의 상충관계를 만족하는 2D Pareto 해를 모두 제공합니다.")
+    ws.freeze_panes(5, 3)
+    _write_section(ws, fmt, 3, "Pareto Solution Dataset", 13)
+    p_end_row, _ = _write_df_table(workbook, ws, pareto_df, 5, 0, "ParetoSolutionsTable", fmt)
+
+    if len(pareto_df) > 1 and all(c in pareto_df.columns for c in ["total_cost", "Ao"]):
+        cols = list(pareto_df.columns)
+        x_col = cols.index("total_cost")
+        y_col = cols.index("Ao")
+        chart = workbook.add_chart({"type": "scatter", "subtype": "straight_with_markers"})
+        chart.add_series({
+            "name": "Pareto Front",
+            "categories": [SHEET_PARETO, 6, x_col, 5 + len(pareto_df), x_col],
+            "values": [SHEET_PARETO, 6, y_col, 5 + len(pareto_df), y_col],
+            "line": {"color": C["blue"], "width": 1.5, "transparency": 20},
+            "marker": {"type": "circle", "size": 4, "fill": {"color": C["blue"]}, "border": {"color": C["white"]}},
+        })
+        _chart_style(chart, "Pareto Front: Cost vs Ao", "Total Cost (KRW)", "Ao")
+        chart.set_y_axis({"name": "Ao", "num_format": "0.0%"})
+        chart.set_x_axis({"name": "Total Cost (KRW)", "num_format": "#,##0,,\"M\""})
+        ws.insert_chart(p_end_row + 3, 0, chart, {"x_scale": 1.65, "y_scale": 1.15})
+
+    # ==================================================================
+    # 04 Best Policy
+    # ==================================================================
+    ws = workbook.add_worksheet(SHEET_POLICY)
+    ws.set_tab_color(C["green"])
+    _write_title(ws, fmt, "대표 목표 Ao 최종 초기수리부속 정책", f"Representative Target = {rep_target:.2%} | Pure NSGA stock and policy minimum quantities are shown separately.")
+    ws.freeze_panes(9, 5)
+
+    _write_section(ws, fmt, 3, "Best Policy KPI", 13)
+    policy_summary = [
+        ("Target Ao", rep_target, "percent"),
+        ("Best Ao", best_ao, "percent"),
+        ("Managed Items", _safe_int(b.get("managed_items", 0)), "number"),
+        ("NSGA Total Stock", _safe_int(b.get("total_stock_units", 0)), "number"),
+        ("Final Spare Items", final_initial_rows, "number"),
+        ("Final Spare Units", final_initial_units, "number"),
+    ]
+    for idx, (label, val, kind) in enumerate(policy_summary):
+        _write_kpi(ws, fmt, 5, idx * 2, label, val, kind, 2)
+
+    table_start = 10
+    _write_section(ws, fmt, table_start, "Final Initial Spare List", 13)
+    _write_df_table(workbook, ws, best_policy_view, table_start + 2, 0, "BestPolicyTable", fmt)
+
+    if len(best_policy_view) > 0:
+        headers = list(best_policy_view.columns)
+        first = table_start + 3
+        last = table_start + 2 + len(best_policy_view)
+        for col_name in ["final_initial_spare_qty", "policy_added_qty", "ao_impact_rank", "p_need_period"]:
+            if col_name in headers:
+                cidx = headers.index(col_name)
+                if col_name in ["ao_impact_rank", "p_need_period"]:
+                    ws.conditional_format(first, cidx, last, cidx, {"type": "3_color_scale", "min_color": "#FEE2E2", "mid_color": "#FEF3C7", "max_color": "#DCFCE7"})
+                else:
+                    ws.conditional_format(first, cidx, last, cidx, {"type": "data_bar", "bar_color": C["teal"] if col_name == "final_initial_spare_qty" else C["amber"]})
+
+    # ==================================================================
+    # 05 Part Diagnostics
+    # ==================================================================
+    ws = workbook.add_worksheet(SHEET_DIAG)
+    ws.set_tab_color("#64748B")
+    _write_title(ws, fmt, "품목별 진단 데이터", "각 부품의 고장강도, 수요확률, Ao 영향, DT/재고 위험, NSGA 선택 및 정책 보정 근거를 추적합니다.")
+    ws.freeze_panes(5, 5)
+    _write_section(ws, fmt, 3, "Explainable Part-level Diagnostics", 13)
+    _write_df_table(workbook, ws, diag_df, 5, 0, "PartDiagnosticsTable", fmt)
+
+    if len(diag_df) > 0:
+        headers = list(diag_df.columns)
+        first, last = 6, 5 + len(diag_df)
+        for col_name in ["ao_impact_rank", "p_need_period"]:
+            if col_name in headers:
+                cidx = headers.index(col_name)
+                ws.conditional_format(first, cidx, last, cidx, {"type": "3_color_scale", "min_color": "#FEE2E2", "mid_color": "#FEF3C7", "max_color": "#DCFCE7"})
+        for col_name in ["final_initial_spare_qty", "total_stock_best", "policy_added_qty"]:
+            if col_name in headers:
+                cidx = headers.index(col_name)
+                ws.conditional_format(first, cidx, last, cidx, {"type": "data_bar", "bar_color": C["blue"]})
+
+    # ==================================================================
+    # 06 DT Analysis
+    # ==================================================================
+    ws = workbook.add_worksheet(SHEET_DT)
+    ws.set_tab_color(C["amber"])
+    _write_title(ws, fmt, "Downtime 분석", "Ao 저하 원인을 Diagnosis / Stock-Wait / Restore로 분해하고 분석기간 일관성을 보여줍니다.")
+    ws.set_column("A:A", 24)
+    ws.set_column("B:D", 18)
+    ws.freeze_panes(5, 0)
+    _write_section(ws, fmt, 3, "DT Decomposition", 8)
+    _write_df_table(workbook, ws, dt_analysis, 5, 0, "DTAnalysisTable", fmt)
+
+    # Formula explanation block
+    ws.merge_range("F6:I6", "Ao Calculation Contract", fmt["subheader"])
+    ws.write("F7", "Analysis period", fmt["label"]); ws.write("G7", years, fmt["value"])
+    ws.write("F8", "T_obs", fmt["label"]); ws.write("G8", t_obs_h, fmt["hours"])
+    ws.write("F9", "Period DT", fmt["label"]); ws.write("G9", dt_total, fmt["hours"])
+    ws.write("F10", "Ao", fmt["label"]); ws.write("G10", best_ao, fmt["percent"])
+    ws.merge_range("F12:I15",
+                   "Period DT = Annual DT × YEARS.  Ao = T_obs / (T_obs + Period DT). "
+                   "Because both operating time and expected downtime scale consistently with YEARS, "
+                   "changing YEARS alone does not artificially inflate Ao under a stationary annual-rate assumption.",
+                   fmt["note"])
+
+    chart = workbook.add_chart({"type": "column"})
+    chart.add_series({
+        "name": "Period DT (h)",
+        "categories": [SHEET_DT, 6, 0, 8, 0],
+        "values": [SHEET_DT, 6, 2, 8, 2],
+        "fill": {"color": C["blue"]},
+        "border": {"none": True},
+        "data_labels": {"value": True, "num_format": "#,##0.0"},
+    })
+    _chart_style(chart, "DT Contribution by Component", "DT Component", "Hours")
+    chart.set_legend({"none": True})
+    ws.insert_chart("A13", chart, {"x_scale": 1.4, "y_scale": 1.1})
+
+    # Top impact parts table/chart
+    if not top_impact.empty:
+        top_start = 31
+        _write_section(ws, fmt, top_start, f"Top {len(top_impact)} Ao-impact Parts", 8)
+        _write_df_table(workbook, ws, top_impact, top_start + 2, 0, "TopImpactPartsTable", fmt)
+        if "Part_ID" in top_impact.columns and "ao_impact" in top_impact.columns:
+            cols = list(top_impact.columns)
+            c_part = cols.index("Part_ID")
+            c_imp = cols.index("ao_impact")
+            chart2 = workbook.add_chart({"type": "bar"})
+            chart2.add_series({
+                "name": "Ao Impact",
+                "categories": [SHEET_DT, top_start + 3, c_part, top_start + 2 + len(top_impact), c_part],
+                "values": [SHEET_DT, top_start + 3, c_imp, top_start + 2 + len(top_impact), c_imp],
+                "fill": {"color": C["teal"]},
+                "border": {"none": True},
+            })
+            _chart_style(chart2, "Highest Ao-impact Parts", "Ao Impact", "Part")
+            chart2.set_legend({"none": True})
+            ws.insert_chart(top_start + 2, 7, chart2, {"x_scale": 1.25, "y_scale": 1.2})
+
+    # ==================================================================
+    # 07 Cost Analysis
+    # ==================================================================
+    ws = workbook.add_worksheet(SHEET_COST)
+    ws.set_tab_color(C["teal"])
+    _write_title(ws, fmt, "비용 분석", "재고비·보유비·예상 정비비와 목표 Ao 상승에 따른 비용 증가를 비교합니다.")
+    ws.freeze_panes(5, 0)
+    _write_section(ws, fmt, 3, "Cost Breakdown", 8)
+    _write_df_table(workbook, ws, cost_analysis, 5, 0, "CostAnalysisTable", fmt)
+
+    chart = workbook.add_chart({"type": "column"})
+    chart.add_series({
+        "name": "Amount (KRW)",
+        "categories": [SHEET_COST, 6, 0, 8, 0],
+        "values": [SHEET_COST, 6, 1, 8, 1],
+        "fill": {"color": C["blue"]},
+        "border": {"none": True},
+        "data_labels": {"value": True, "num_format": "#,##0,,\"M\""},
+    })
+    _chart_style(chart, "Cost Components", "Component", "KRW")
+    chart.set_y_axis({"name": "KRW", "num_format": "#,##0,,\"M\""})
+    chart.set_legend({"none": True})
+    ws.insert_chart("F6", chart, {"x_scale": 1.4, "y_scale": 1.0})
+
+    # Marginal cost of higher selected Ao
+    marginal = decision_df[["target_ao", "selected_Ao", "total_cost", "managed_items", "purchase_stock_units"]].copy()
+    marginal = marginal.sort_values("target_ao").reset_index(drop=True)
+    marginal["delta_Ao"] = marginal["selected_Ao"].diff()
+    marginal["delta_cost_KRW"] = marginal["total_cost"].diff()
+    marginal["cost_per_1pct_Ao_KRW"] = np.where(
+        marginal["delta_Ao"].abs() > 1e-12,
+        marginal["delta_cost_KRW"] / (marginal["delta_Ao"] * 100.0),
+        np.nan,
+    )
+    m_start = 20
+    _write_section(ws, fmt, m_start, "Marginal Cost of Availability", 8)
+    _write_df_table(workbook, ws, marginal, m_start + 2, 0, "MarginalCostTable", fmt)
+
+    # ==================================================================
+    # 08 Model Settings
+    # ==================================================================
+    ws = workbook.add_worksheet(SHEET_SETTINGS)
+    ws.set_tab_color(C["navy"])
+    _write_title(ws, fmt, "모델 설정 및 추적정보", "재현성을 위해 분석기간, 고장률 단위, NSGA 파라미터, 정책 임계값과 입력파일 정보를 기록합니다.")
+    ws.freeze_panes(5, 0)
+    _write_section(ws, fmt, 3, "Model / Run Settings", 6)
+    _write_df_table(workbook, ws, settings_df, 5, 0, "ModelSettingsTable", fmt)
+    ws.set_column("A:A", 38)
+    ws.set_column("B:B", 80, fmt["text_wrap"])
+
+    # ==================================================================
+    # Common finishing touches
+    # ==================================================================
+    # Ensure every sheet starts with a clean zoom and useful print behavior.
+    for sname in [
+        SHEET_EXECUTIVE, SHEET_TARGET, SHEET_PARETO, SHEET_POLICY,
+        SHEET_DIAG, SHEET_DT, SHEET_COST, SHEET_SETTINGS,
+    ]:
+        sheet = workbook.get_worksheet_by_name(sname)
+        sheet.set_zoom(90)
+        sheet.set_landscape()
+        sheet.fit_to_pages(1, 0)
+        sheet.set_margins(left=0.25, right=0.25, top=0.5, bottom=0.5)
+        sheet.set_header("&L" + REPORT_TITLE + "&R" + sname)
+        sheet.set_footer("&LGenerated by NSGA-II Report Export&RPage &P of &N")
+
+    workbook.close()
+
+    if not os.path.exists(output_path) or os.path.getsize(output_path) <= 0:
+        raise IOError(f"Excel report was not created correctly: {output_path}")
+
+    print("\n" + "=" * 72)
+    print("[EXCEL REPORT EXPORT COMPLETE]")
+    print(f"Report : {output_path}")
+    print(f"Size   : {os.path.getsize(output_path):,} bytes")
+    print("Sheets :")
+    for s in [
+        SHEET_EXECUTIVE, SHEET_TARGET, SHEET_PARETO, SHEET_POLICY,
+        SHEET_DIAG, SHEET_DT, SHEET_COST, SHEET_SETTINGS,
+    ]:
+        print(f"  - {s}")
+    print("=" * 72)
+    return output_path
+
+
+# ======================================================================
+# 4) Auto-run when this module is executed after the NSGA model.
+# ======================================================================
+# Set AUTO_EXPORT_REPORT=False in the notebook namespace before executing
+# this module if you only want to load the function without exporting.
+AUTO_EXPORT_REPORT = globals().get("AUTO_EXPORT_REPORT", True)
+
+if AUTO_EXPORT_REPORT:
+    export_nsga_excel_report(namespace=globals())
